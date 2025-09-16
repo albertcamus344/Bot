@@ -1,4 +1,5 @@
-# YouTube Downloader Telegram Bot
+# Create comprehensive README
+readme_content = '''# YouTube Downloader Telegram Bot
 
 A powerful Telegram bot that allows you to download YouTube videos in multiple qualities, extract audio, download subtitles in various languages, and get video thumbnails.
 
@@ -30,7 +31,7 @@ chmod +x setup.sh
 1. Create virtual environment:
 ```bash
 python3 -m venv youtube_bot_env
-source youtube_bot_env/bin/activate  # On Windows: youtube_bot_env\Scripts\activate
+source youtube_bot_env/bin/activate  # On Windows: youtube_bot_env\\Scripts\\activate
 ```
 
 2. Install dependencies:
@@ -169,3 +170,9 @@ If you encounter issues:
 ---
 
 **Happy downloading! 🎉**
+'''
+
+with open('README.md', 'w', encoding='utf-8') as f:
+    f.write(readme_content)
+
+print("✅ README file created: README.md")

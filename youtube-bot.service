@@ -1,0 +1,22 @@
+[Unit]
+Description=YouTube Downloader Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=botuser
+WorkingDirectory=/opt/youtube-bot
+Environment=PATH=/opt/youtube-bot/youtube_bot_env/bin
+ExecStart=/opt/youtube-bot/youtube_bot_env/bin/python /opt/youtube-bot/youtube_bot.py
+Restart=always
+RestartSec=10
+
+# Security settings
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/youtube-bot
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

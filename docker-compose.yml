@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  youtube-bot:
+    build: .
+    environment:
+      - TELEGRAM_BOT_TOKEN=${BOT_TOKEN}
+      - DEBUG_MODE=false
+      - MAX_FILE_SIZE_BYTES=52428800
+    volumes:
+      - ./downloads:/tmp/youtube_bot
+      - ./logs:/app/logs
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
