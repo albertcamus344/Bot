@@ -1,304 +1,262 @@
-# bot.py
 import os
+import logging
 import re
-import math
-import tempfile
-import asyncio
-from datetime import timedelta
-
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, InputFile
-from telegram.constants import ChatAction
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
-
+import json
 from yt_dlp import YoutubeDL
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+from telegram.constants import ParseMode
 
-BOT_TOKEN = os.environ["8264683279:AAGoejkdiRl2kWe2NPu5bdQPE1hI5UvD9-4"]
+# --- Configuration ---
+# Replace 'YOUR_TELEGRAM_BOT_TOKEN' with the token you got from BotFather
+BOT_TOKEN = "8264683279:AAGoejkdiRl2kWe2NPu5bdQPE1hI5UvD9-4"
+# --- End Configuration ---
 
-# Telegram Bot API limits (bots): up to ~2 GB; stay a bit under to be safe.
-TELEGRAM_BOT_MAX_BYTES = 2_000_000_000  # bot hard limit; do not exceed [web:3][web:7][web:13]
+# Enable logging
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-YDL_BASE_OPTS = {
-    # Keep yt-dlp updated or SABR/format issues can force 360p fallbacks. [web:6][web:9][web:12]
-    "noplaylist": True,
-    "ignoreerrors": False,
-    "quiet": True,
-    "no_warnings": True,
-    "concurrent_fragment_downloads": 5,
-    "retries": 5,
-    "fragment_retries": 5,
-    "http_chunk_size": 10485760,  # 10MB
-    "prefer_free_formats": False,  # allow avc/h264/hevc/vp9/av1 etc. [web:1]
-    "merge_output_format": "mp4",  # try to get mp4; yt-dlp will transcode/merge as needed [web:1]
-    "outtmpl": "%(title).200B [%(id)s].%(ext)s",
-    "writesubtitles": False,
-    "writeautomaticsub": False,
-    "subtitleslangs": ["en.*,.*"],  # prefer en and any available [web:1]
-    "postprocessors": [
-        {"key": "FFmpegMetadata"},
-        {"key": "FFmpegEmbedSubtitle"}  # embed softsubs when possible [web:1]
-    ],
-}
+# A simple regex to find YouTube URLs
+YOUTUBE_URL_REGEX = r'(https?://)?(www\.)?(youtube|youtu|youtube-nocookie)\.(com|be)/(watch\?v=|embed/|v/|.+\?v=)?([^&=%\?]{11})'
 
-YDL_LIST_OPTS = {
-    **YDL_BASE_OPTS,
-    "listformats": False,
-    "dump_single_json": True,   # get full info dict with formats/subs [web:1]
-}
+# --- Command Handlers ---
 
-URL_RE = re.compile(r"https?://(www\.)?(youtube\.com|youtu\.be)/\S+")
-
-def human_size(n):
-    units = ["B","KB","MB","GB","TB"]
-    i = 0
-    while n >= 1024 and i < len(units)-1:
-        n /= 1024.0
-        i += 1
-    return f"{n:.2f} {units[i]}"
-
-def build_format_rows(info):
-    # Build friendly choices: distinct resolutions for muxed or mergeable formats, plus audio-only. [web:1]
-    formats = info.get("formats", [])
-    choices = {}
-    audio_only = []
-
-    for f in formats:
-        fmt_id = f.get("format_id")
-        vcodec = f.get("vcodec")
-        acodec = f.get("acodec")
-        height = f.get("height")
-        ext = f.get("ext")
-        filesize = f.get("filesize") or f.get("filesize_approx")
-        if (vcodec is None or vcodec == "none") and (acodec and acodec != "none"):
-            audio_only.append({
-                "id": fmt_id, "label": f"Audio {acodec or ''} {ext or ''} {human_size(filesize) if filesize else ''}".strip(),
-                "filesize": filesize
-            })
-        elif vcodec and vcodec != "none":
-            res = f"{height}p" if height else f.get("format_note") or "video"
-            # store best size per res (prefer formats with acodec to avoid merging when possible) [web:1]
-            key = (res, acodec != "none")
-            prev = choices.get(key)
-            if prev is None or (filesize and prev.get("filesize", 0) and filesize < prev["filesize"]):
-                choices[key] = {
-                    "id": fmt_id,
-                    "res": res,
-                    "has_audio": acodec != "none",
-                    "filesize": filesize,
-                    "ext": ext or "mp4",
-                    "vcodec": vcodec,
-                }
-
-    # Collapse keys into buttons, prefer has-audio True first for each resolution. [web:1]
-    by_res = {}
-    for (res, has_audio), item in choices.items():
-        best = by_res.get(res)
-        if best is None or (has_audio and not best["has_audio"]):
-            by_res[res] = item
-
-    # Sort descending by numeric resolution when possible. [web:1]
-    def res_key(r):
-        try:
-            return -int(r.replace("p",""))
-        except:
-            return 0
-    ordered = [by_res[r] for r in sorted(by_res.keys(), key=res_key)]
-    return ordered, audio_only
-
-async def progress_cb(current, total, update: Update, context: ContextTypes.DEFAULT_TYPE, prefix="Uploading"):
-    try:
-        pct = (current / total) * 100 if total else 0
-        bar_len = 15
-        filled = math.floor(bar_len * pct / 100)
-        bar = "█"*filled + "·"*(bar_len - filled)
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_DOCUMENT)
-        # Avoid spamming too frequently; this is a simple progress notifier pattern. [web:13]
-        if int(pct) % 10 == 0:
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=f"{prefix}: {bar} {pct:.0f}% ({human_size(current)}/{human_size(total)})"
-            )
-    except Exception:
-        pass
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Send a YouTube link to get download options (resolutions, audio, subtitles).")  # [web:13]
-
-async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    match = URL_RE.search(text)
-    if not match:
-        return
-    url = match.group(0)
-
-    await update.message.reply_text("Fetching formats...")  # [web:13]
-
-    # Ensure yt-dlp modern behavior to avoid 360p-only pitfalls:
-    # - no stale cookies, no forced tv/web-client with SABR-only; rely on default client mix. [web:9][web:12]
-    # - keep yt-dlp updated in environment (pip install -U yt-dlp regularly). [web:6][web:1]
-    with YoutubeDL(YDL_LIST_OPTS) as ydl:
-        info = ydl.extract_info(url, download=False)
-
-    title = info.get("title", "video")
-    formats = info.get("formats", [])
-    subs = info.get("subtitles") or info.get("automatic_captions") or {}
-
-    video_choices, audio_only = build_format_rows(info)
-
-    buttons = []
-    # Best (let yt-dlp pick bestvideo+bestaudio and merge)
-    buttons.append([InlineKeyboardButton(text="Best (auto merge)", callback_data=f"best|{url}")])
-
-    # Specific resolutions
-    for item in video_choices[:12]:
-        res = item["res"]
-        label = f"{res}{' (muxed)' if item['has_audio'] else ''}"
-        buttons.append([InlineKeyboardButton(text=label, callback_data=f"v:{item['id']}|{url}")])
-
-    # Audio-only options (present generic choice instead)
-    if audio_only:
-        buttons.append([InlineKeyboardButton(text="Audio only (best)", callback_data=f"audio|{url}")])
-
-    # Subtitles toggle
-    has_subs = bool(subs)
-    if has_subs:
-        buttons.append([InlineKeyboardButton(text="Include subtitles", callback_data=f"subs:on|{url}")])
-        buttons.append([InlineKeyboardButton(text="Without subtitles", callback_data=f"subs:off|{url}")])
-
-    # Keep a small context map per chat
-    context.user_data["pending_url"] = url
-    context.user_data["include_subs"] = has_subs  # default to include when available
-
-    await update.message.reply_text(
-        f"Select a download option for: {title}",  # [web:13]
-        reply_markup=InlineKeyboardMarkup(buttons)
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Sends a welcome message when the /start command is issued."""
+    user = update.effective_user
+    await update.message.reply_html(
+        rf"Hi {user.mention_html()}! 👋",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("How to use", callback_data="help")]
+        ])
     )
+    await help_command(update, context)
 
-async def on_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Sends a help message."""
+    help_text = (
+        "🔗 **How to use this bot:**\n\n"
+        "1. Send me any YouTube link (e.g., `youtube.com/watch?v=...` or `youtu.be/...`).\n"
+        "2. I will show you a list of available download options.\n"
+        "3. Choose the format you want (video, audio, or subtitles).\n"
+        "4. Wait for me to download and upload the file for you.\n\n"
+        "Enjoy! ✨"
+    )
+    # If called from a button, edit the message. Otherwise, send a new one.
+    if update.callback_query:
+        await update.callback_query.message.edit_text(help_text, parse_mode=ParseMode.MARKDOWN)
+    else:
+        await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
+
+# --- Message and Callback Handlers ---
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles incoming messages to find YouTube links."""
+    message_text = update.message.text
+    match = re.search(YOUTUBE_URL_REGEX, message_text)
+
+    if not match:
+        await update.message.reply_text("Please send a valid YouTube video link.")
+        return
+
+    url = match.group(0)
+    status_message = await update.message.reply_text("🔍 Processing your link, please wait...")
+
+    try:
+        # Use yt-dlp to extract video information
+        ydl_opts = {'quiet': True, 'skip_download': True}
+        with YoutubeDL(ydl_opts) as ydl:
+            info_dict = ydl.extract_info(url, download=False)
+
+        # Store video info in context for later use in callbacks
+        context.user_data['video_info'] = info_dict
+        context.user_data['video_url'] = url
+
+        keyboard = build_keyboard(info_dict)
+
+        if not keyboard:
+             await status_message.edit_text("Couldn't find any downloadable formats for this video.")
+             return
+
+        await status_message.edit_text(
+            f"🎬 **{info_dict.get('title', 'N/A')}**\n\n"
+            "Please choose a format to download:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    except Exception as e:
+        logger.error(f"Error processing URL {url}: {e}")
+        await status_message.edit_text(f"Sorry, I couldn't process that link. 😞\nError: {e}")
+
+def build_keyboard(info: dict) -> list:
+    """Builds the inline keyboard with download options."""
+    keyboard = []
+    video_formats = []
+    
+    # Filter and sort video formats by resolution
+    for f in info.get('formats', []):
+        # We want video-only streams that we can merge with audio
+        if f.get('vcodec') != 'none' and f.get('acodec') == 'none' and f.get('ext') == 'mp4':
+            resolution = f.get('height')
+            if resolution:
+                # Avoid duplicates
+                if not any(vf['resolution'] == resolution for vf in video_formats):
+                    video_formats.append({
+                        'resolution': resolution,
+                        'format_id': f['format_id'],
+                        'filesize': f.get('filesize') or f.get('filesize_approx', 0),
+                        'ext': f.get('ext')
+                    })
+    
+    # Sort by resolution descending
+    video_formats.sort(key=lambda x: x['resolution'], reverse=True)
+
+    # Create buttons for video formats
+    for vf in video_formats[:5]: # Limit to top 5 resolutions
+        filesize_mb = f"{(vf['filesize'] / 1024 / 1024):.2f} MB" if vf['filesize'] else 'N/A'
+        button_text = f"📹 {vf['resolution']}p ({vf['ext']}) - {filesize_mb}"
+        callback_data = f"video|{vf['format_id']}|{vf['ext']}"
+        keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
+    
+    # Add Audio button
+    keyboard.append([InlineKeyboardButton("🎵 Audio Only (best quality, mp3)", callback_data="audio|best|mp3")])
+    
+    # Add Subtitle buttons
+    subtitles = info.get('subtitles', {})
+    if subtitles:
+        subtitle_buttons = []
+        for lang_code, sub_info in list(subtitles.items())[:3]: # Limit to 3 subtitle languages
+            lang_name = sub_info[0].get('name', lang_code)
+            subtitle_buttons.append(
+                InlineKeyboardButton(f"📜 {lang_name}", callback_data=f"subtitle|{lang_code}|srt")
+            )
+        if subtitle_buttons:
+            keyboard.append(subtitle_buttons)
+
+    return keyboard
+
+async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Parses the callback_data from the inline keyboard."""
     query = update.callback_query
     await query.answer()
+
     data = query.data
-    # Parse toggles and commands
-    if data.startswith("subs:"):
-        val, url = data.split("|", 1)
-        include = val.endswith("on")
-        context.user_data["include_subs"] = include
-        await query.edit_message_text(f"Subtitles: {'on' if include else 'off'}. Choose a quality above or pick Best/Audio.")  # [web:13]
+    
+    if data == "help":
+        await help_command(update, context)
+        return
+        
+    url = context.user_data.get('video_url')
+    if not url:
+        await query.edit_message_text("Sorry, I lost the context. Please send the link again.")
         return
 
-    if "|" in data:
-        choice, url = data.split("|", 1)
-    else:
-        choice = data
-        url = context.user_data.get("pending_url")
+    try:
+        download_type, format_id, ext = data.split('|')
+        
+        status_message = await query.edit_message_text(f"📥 **Downloading...**\nPlease wait, this might take a while depending on the file size.")
+        
+        output_filename = await download_file(url, download_type, format_id, ext, context)
+        
+        if not output_filename or not os.path.exists(output_filename):
+            raise FileNotFoundError("Downloaded file not found.")
 
-    include_subs = context.user_data.get("include_subs", False)
+        await status_message.edit_text("📤 **Uploading to Telegram...**")
+        
+        # Upload the file
+        if download_type == 'video':
+            await context.bot.send_video(chat_id=query.message.chat_id, video=open(output_filename, 'rb'), supports_streaming=True)
+        elif download_type == 'audio':
+            await context.bot.send_audio(chat_id=query.message.chat_id, audio=open(output_filename, 'rb'))
+        elif download_type == 'subtitle':
+            await context.bot.send_document(chat_id=query.message.chat_id, document=open(output_filename, 'rb'))
+        
+        await status_message.delete()
 
-    # Build yt-dlp options based on choice
-    ydl_opts = dict(YDL_BASE_OPTS)
-    # Subtitle handling [web:1]
-    if include_subs:
-        ydl_opts["writesubtitles"] = True
-        ydl_opts["writeautomaticsub"] = True
-        ydl_opts["subtitleslangs"] = ["en.*,.*"]
-        # Embed where possible via FFmpegEmbedSubtitle postprocessor already set [web:1]
-    else:
-        ydl_opts["writesubtitles"] = False
-        ydl_opts["writeautomaticsub"] = False
-        # Remove embed postprocessor if no subs
-        ydl_opts["postprocessors"] = [pp for pp in ydl_opts["postprocessors"] if pp["key"] != "FFmpegEmbedSubtitle"]
+    except Exception as e:
+        logger.error(f"Error during download/upload: {e}")
+        await query.edit_message_text(f"An error occurred: {e}")
+    finally:
+        # Clean up the downloaded file
+        if 'output_filename' in locals() and os.path.exists(output_filename):
+            os.remove(output_filename)
 
-    # Format selector to avoid 360p-only:
-    # - For "best", explicitly request bestvideo*+bestaudio/best to get highest resoln + merge. [web:1][web:11]
-    # - For specific format_id, use that format explicitly, and if it’s video-only, pair with bestaudio for merging. [web:1]
-    if choice == "best":
-        ydl_opts["format"] = "bv*+ba/b"  # robust best selection [web:1][web:11]
-    elif choice == "audio":
-        ydl_opts["format"] = "bestaudio/bestaudio*"
-        # Convert to m4a/mp3 via postprocessor if needed (optional)
-    elif choice.startswith("v:"):
-        fmt_id = choice.split(":", 1)[1]
-        # Try requested format; if video-only, merge with bestaudio. [web:1]
-        ydl_opts["format"] = f"{fmt_id}+bestaudio/{fmt_id}"
-    else:
-        ydl_opts["format"] = "bv*+ba/b"
 
-    # Use a private temp dir per task
-    with tempfile.TemporaryDirectory() as tmpdir:
-        ydl_opts["paths"] = {"home": tmpdir, "temp": tmpdir}
-        # Avoid partially huge files beyond Telegram limit by pre-checking selected format size via info JSON. [web:13]
-        # We’ll still guard after download, but try to avoid wasting bandwidth.
-        # Note: exact merged size can differ; still re-check after download. [web:1]
-        await query.edit_message_text("Downloading... this may take a while.")  # [web:13]
-        file_path = None
-        thumb_path = None
-        title = "video"
+async def download_file(url: str, download_type: str, format_id: str, ext: str, context: ContextTypes.DEFAULT_TYPE) -> str:
+    """Downloads the file using yt-dlp based on user's choice."""
+    # Sanitize title for filename
+    title = context.user_data['video_info'].get('title', 'video')
+    safe_title = re.sub(r'[\\/*?:"<>|]', "", title)[:50] # Limit length
+    
+    output_template = f'{safe_title}.%(ext)s'
+    
+    ydl_opts = {
+        'outtmpl': output_template,
+        'noplaylist': True,
+    }
 
-        def progress_hook(d):
-            # Optional: could add download progress messages here (status downloading)
-            pass
+    if download_type == 'video':
+        # THIS IS THE KEY: We specify the chosen video format ID and merge it with the best available audio
+        ydl_opts['format'] = f'{format_id}+bestaudio/best'
+        # To ensure the final container is mp4 if possible
+        ydl_opts['merge_output_format'] = 'mp4'
 
-        ydl_opts["progress_hooks"] = [progress_hook]
+    elif download_type == 'audio':
+        ydl_opts['format'] = 'bestaudio/best'
+        ydl_opts['postprocessors'] = [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '192',
+        }]
+        # The extension will be mp3 after post-processing
+        output_template = f'{safe_title}.mp3'
+        ydl_opts['outtmpl'] = output_template
 
-        try:
-            loop = asyncio.get_event_loop()
-            def run_download():
-                with YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(url, download=True)
-                    out = ydl.prepare_filename(info)
-                    # If merged container differs, yt-dlp may return proper path via info dict
-                    nonlocal_file = info.get("requested_downloads", [{}])[0].get("filepath") or out
-                    return info, nonlocal_file
-            info, file_path = await loop.run_in_executor(None, run_download)
-            title = info.get("title") or "video"
 
-            # Check size
-            stat = os.stat(file_path)
-            if stat.st_size > TELEGRAM_BOT_MAX_BYTES:
-                await query.edit_message_text(
-                    f"File is {human_size(stat.st_size)}, exceeds bot upload limit (~2 GB). Try a lower resolution or audio-only."  # [web:3][web:7][web:13]
-                )
-                return
+    elif download_type == 'subtitle':
+        ydl_opts['writesubtitles'] = True
+        ydl_opts['subtitleslangs'] = [format_id] # format_id is the lang_code here
+        ydl_opts['skip_download'] = True
+        # The filename will be title.lang.ext
+        output_template = f'{safe_title}.{format_id}.{ext}'
+        ydl_opts['outtmpl'] = f'{safe_title}.%(ext)s'
 
-            # Optional: try to locate a thumbnail created by yt-dlp/ffmpeg [web:3]
-            for name in os.listdir(tmpdir):
-                if name.lower().endswith((".jpg",".jpeg",".png")) and info.get("id","") in name:
-                    thumb_path = os.path.join(tmpdir, name)
-                    break
 
-            await query.edit_message_text("Uploading to Telegram...")  # [web:13]
+    with YoutubeDL(ydl_opts) as ydl:
+        ydl.download([url])
 
-            # Choose send method: send_video for mp4 with small size, else send_document for general files. [web:13]
-            filename = os.path.basename(file_path)
-            mime_is_video = filename.lower().endswith((".mp4",".mkv",".webm",".mov"))
-            chat_id = update.effective_chat.id
-            total_size = stat.st_size
-            sent = 0
+    # Determine the final output filename
+    if download_type == 'audio':
+        return f'{safe_title}.mp3'
+    elif download_type == 'subtitle':
+        # yt-dlp might create a vtt or srt, we check for it
+        for file in os.listdir('.'):
+            if file.startswith(safe_title) and file.endswith(f'.{format_id}.{ext}'):
+                return file
+        return f'{safe_title}.{format_id}.{ext}' # Fallback
+    else: # Video
+        return f'{safe_title}.mp4'
 
-            # python-telegram-bot handles upload streaming; add minimal progress pings. [web:13][web:8]
-            # Simplify: use send_document for reliability across containers.
-            with open(file_path, "rb") as f:
-                await context.bot.send_document(
-                    chat_id=chat_id,
-                    document=InputFile(f, filename=filename),
-                    caption=title[:900],
-                    thumbnail=InputFile(thumb_path) if thumb_path else None,
-                )
 
-            await context.bot.send_message(chat_id=chat_id, text="Done.")  # [web:13]
+# --- Main Bot Execution ---
 
-        except Exception as e:
-            await query.edit_message_text(f"Error: {e}")  # [web:13]
+def main() -> None:
+    """Start the bot."""
+    application = Application.builder().token(BOT_TOKEN).build()
 
-async def main():
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
-    app.add_handler(CallbackQueryHandler(on_choice))
-    await app.initialize()
-    await app.start()
-    print("Bot started")
-    await app.updater.start_polling()
-    await app.updater.idle()
+    # Register handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(CallbackQueryHandler(button_callback_handler))
+
+    # Run the bot until the user presses Ctrl-C
+    logger.info("Bot is running...")
+    application.run_polling()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
