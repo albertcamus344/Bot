@@ -1,262 +1,235 @@
-import os
+# youtube_downloader_bot.py
+
 import logging
-import re
-import json
-from yt_dlp import YoutubeDL
+import os
+from pytube import YouTube
+from moviepy.editor import VideoFileClip, AudioFileClip
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
-from telegram.constants import ParseMode
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+from uuid import uuid4
 
 # --- Configuration ---
-# Replace 'YOUR_TELEGRAM_BOT_TOKEN' with the token you got from BotFather
-BOT_TOKEN = "8264683279:AAGoejkdiRl2kWe2NPu5bdQPE1hI5UvD9-4"
-# --- End Configuration ---
+# Replace 'YOUR_TELEGRAM_BOT_TOKEN' with the token you get from BotFather
+TELEGRAM_BOT_TOKEN = '8264683279:AAGoejkdiRl2kWe2NPu5bdQPE1hI5UvD9-4' 
+DOWNLOAD_PATH = 'downloads'
 
-# Enable logging
+# --- Setup Logging ---
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# A simple regex to find YouTube URLs
-YOUTUBE_URL_REGEX = r'(https?://)?(www\.)?(youtube|youtu|youtube-nocookie)\.(com|be)/(watch\?v=|embed/|v/|.+\?v=)?([^&=%\?]{11})'
+# --- Helper Functions ---
+def get_video_streams(yt: YouTube):
+    """
+    Fetches and organizes video and audio streams to solve the 360p-only issue.
+    pytube often lists progressive streams (video+audio) only up to 360p or 720p.
+    To get higher resolutions, we must get adaptive streams (video-only) and 
+    merge them with an audio stream.
+    """
+    streams_dict = {}
+    
+    # Get adaptive streams (separate video and audio) for high quality
+    video_streams = yt.streams.filter(adaptive=True, file_extension='mp4').order_by('resolution').desc()
+    audio_stream = yt.streams.filter(only_audio=True, file_extension='mp4').order_by('abr').desc().first()
+
+    for stream in video_streams:
+        # Ignore streams without resolution (e.g., audio only)
+        if stream.resolution:
+            # Calculate file size in MB
+            filesize = stream.filesize / (1024 * 1024)
+            if filesize > 0 and stream.resolution not in streams_dict:
+                 streams_dict[stream.resolution] = {
+                    'video_itag': stream.itag,
+                    'filesize_mb': filesize,
+                    'audio_itag': audio_stream.itag if audio_stream else None
+                }
+
+    # Add audio-only option
+    if audio_stream:
+        audio_filesize = audio_stream.filesize / (1024 * 1024)
+        streams_dict['audio_only'] = {
+            'video_itag': None,
+            'filesize_mb': audio_filesize,
+            'audio_itag': audio_stream.itag
+        }
+        
+    return streams_dict
+
+def cleanup_files(files: list):
+    """Deletes temporary files from the server."""
+    for file_path in files:
+        if file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+                logger.info(f"Cleaned up file: {file_path}")
+            except OSError as e:
+                logger.error(f"Error deleting file {file_path}: {e}")
 
 # --- Command Handlers ---
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Sends a welcome message when the /start command is issued."""
-    user = update.effective_user
     await update.message.reply_html(
-        rf"Hi {user.mention_html()}! 👋",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("How to use", callback_data="help")]
-        ])
+        "👋 <b>Welcome to the YouTube Downloader Bot!</b>\n\n"
+        "Send me a YouTube video link and I'll give you options to download it as a video or audio file."
     )
-    await help_command(update, context)
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Sends a help message."""
-    help_text = (
-        "🔗 **How to use this bot:**\n\n"
-        "1. Send me any YouTube link (e.g., `youtube.com/watch?v=...` or `youtu.be/...`).\n"
-        "2. I will show you a list of available download options.\n"
-        "3. Choose the format you want (video, audio, or subtitles).\n"
-        "4. Wait for me to download and upload the file for you.\n\n"
-        "Enjoy! ✨"
-    )
-    # If called from a button, edit the message. Otherwise, send a new one.
-    if update.callback_query:
-        await update.callback_query.message.edit_text(help_text, parse_mode=ParseMode.MARKDOWN)
-    else:
-        await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
-
-# --- Message and Callback Handlers ---
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles incoming messages to find YouTube links."""
-    message_text = update.message.text
-    match = re.search(YOUTUBE_URL_REGEX, message_text)
+    """Handles messages containing YouTube links."""
+    url = update.message.text
+    if "youtube.com/" in url or "youtu.be/" in url:
+        status_message = await update.message.reply_text("🔗 Got your link! Fetching video details...")
+        
+        try:
+            yt = YouTube(url)
+            streams = get_video_streams(yt)
+            
+            if not streams:
+                await status_message.edit_text("❌ Sorry, I couldn't find any downloadable streams for this video.")
+                return
 
-    if not match:
-        await update.message.reply_text("Please send a valid YouTube video link.")
-        return
-
-    url = match.group(0)
-    status_message = await update.message.reply_text("🔍 Processing your link, please wait...")
-
-    try:
-        # Use yt-dlp to extract video information
-        ydl_opts = {'quiet': True, 'skip_download': True}
-        with YoutubeDL(ydl_opts) as ydl:
-            info_dict = ydl.extract_info(url, download=False)
-
-        # Store video info in context for later use in callbacks
-        context.user_data['video_info'] = info_dict
-        context.user_data['video_url'] = url
-
-        keyboard = build_keyboard(info_dict)
-
-        if not keyboard:
-             await status_message.edit_text("Couldn't find any downloadable formats for this video.")
-             return
-
-        await status_message.edit_text(
-            f"🎬 **{info_dict.get('title', 'N/A')}**\n\n"
-            "Please choose a format to download:",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode=ParseMode.MARKDOWN
-        )
-
-    except Exception as e:
-        logger.error(f"Error processing URL {url}: {e}")
-        await status_message.edit_text(f"Sorry, I couldn't process that link. 😞\nError: {e}")
-
-def build_keyboard(info: dict) -> list:
-    """Builds the inline keyboard with download options."""
-    keyboard = []
-    video_formats = []
-    
-    # Filter and sort video formats by resolution
-    for f in info.get('formats', []):
-        # We want video-only streams that we can merge with audio
-        if f.get('vcodec') != 'none' and f.get('acodec') == 'none' and f.get('ext') == 'mp4':
-            resolution = f.get('height')
-            if resolution:
-                # Avoid duplicates
-                if not any(vf['resolution'] == resolution for vf in video_formats):
-                    video_formats.append({
-                        'resolution': resolution,
-                        'format_id': f['format_id'],
-                        'filesize': f.get('filesize') or f.get('filesize_approx', 0),
-                        'ext': f.get('ext')
-                    })
-    
-    # Sort by resolution descending
-    video_formats.sort(key=lambda x: x['resolution'], reverse=True)
-
-    # Create buttons for video formats
-    for vf in video_formats[:5]: # Limit to top 5 resolutions
-        filesize_mb = f"{(vf['filesize'] / 1024 / 1024):.2f} MB" if vf['filesize'] else 'N/A'
-        button_text = f"📹 {vf['resolution']}p ({vf['ext']}) - {filesize_mb}"
-        callback_data = f"video|{vf['format_id']}|{vf['ext']}"
-        keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
-    
-    # Add Audio button
-    keyboard.append([InlineKeyboardButton("🎵 Audio Only (best quality, mp3)", callback_data="audio|best|mp3")])
-    
-    # Add Subtitle buttons
-    subtitles = info.get('subtitles', {})
-    if subtitles:
-        subtitle_buttons = []
-        for lang_code, sub_info in list(subtitles.items())[:3]: # Limit to 3 subtitle languages
-            lang_name = sub_info[0].get('name', lang_code)
-            subtitle_buttons.append(
-                InlineKeyboardButton(f"📜 {lang_name}", callback_data=f"subtitle|{lang_code}|srt")
+            keyboard = []
+            for res, data in streams.items():
+                if res == 'audio_only':
+                    label = f"🎵 Audio Only ({data['filesize_mb']:.2f} MB)"
+                    callback_data = f"download_audio|{yt.video_id}|{data['audio_itag']}"
+                else:
+                    label = f"🎬 {res} ({data['filesize_mb']:.2f} MB)"
+                    callback_data = f"download_video|{yt.video_id}|{data['video_itag']}|{data['audio_itag']}"
+                
+                keyboard.append([InlineKeyboardButton(label, callback_data=callback_data)])
+            
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await status_message.edit_text(
+                f"✅ Found it! <b>{yt.title}</b>\n\n"
+                "Please select a resolution to download:",
+                reply_markup=reply_markup,
+                parse_mode='HTML'
             )
-        if subtitle_buttons:
-            keyboard.append(subtitle_buttons)
+            
+        except Exception as e:
+            logger.error(f"Error processing URL {url}: {e}")
+            await status_message.edit_text("❌ An error occurred. Please check if the link is correct and public.")
+    else:
+        await update.message.reply_text("Please send me a valid YouTube link.")
 
-    return keyboard
-
-async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Parses the callback_data from the inline keyboard."""
+# --- Callback Query Handler ---
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles button presses for downloads."""
     query = update.callback_query
-    await query.answer()
-
-    data = query.data
+    await query.answer() # Acknowledge the button press
     
-    if data == "help":
-        await help_command(update, context)
-        return
-        
-    url = context.user_data.get('video_url')
-    if not url:
-        await query.edit_message_text("Sorry, I lost the context. Please send the link again.")
-        return
+    data = query.data.split('|')
+    action = data[0]
+    video_id = data[1]
+    
+    yt_url = f"https://www.youtube.com/watch?v={video_id}"
+    yt = YouTube(yt_url)
+    
+    # Generate unique filenames to avoid conflicts
+    unique_id = str(uuid4())
+    
+    video_path = None
+    audio_path = None
+    output_path = None
+
+    await query.edit_message_text(text="⏳ Starting download...")
 
     try:
-        download_type, format_id, ext = data.split('|')
-        
-        status_message = await query.edit_message_text(f"📥 **Downloading...**\nPlease wait, this might take a while depending on the file size.")
-        
-        output_filename = await download_file(url, download_type, format_id, ext, context)
-        
-        if not output_filename or not os.path.exists(output_filename):
-            raise FileNotFoundError("Downloaded file not found.")
+        if action == "download_video":
+            video_itag = int(data[2])
+            audio_itag = int(data[3])
+            
+            video_stream = yt.streams.get_by_itag(video_itag)
+            audio_stream = yt.streams.get_by_itag(audio_itag)
 
-        await status_message.edit_text("📤 **Uploading to Telegram...**")
-        
-        # Upload the file
-        if download_type == 'video':
-            await context.bot.send_video(chat_id=query.message.chat_id, video=open(output_filename, 'rb'), supports_streaming=True)
-        elif download_type == 'audio':
-            await context.bot.send_audio(chat_id=query.message.chat_id, audio=open(output_filename, 'rb'))
-        elif download_type == 'subtitle':
-            await context.bot.send_document(chat_id=query.message.chat_id, document=open(output_filename, 'rb'))
-        
-        await status_message.delete()
+            # Download video and audio streams
+            await query.edit_message_text(text=f"📥 Downloading video ({video_stream.resolution})...")
+            video_path = video_stream.download(output_path=DOWNLOAD_PATH, filename_prefix=f"{unique_id}_video_")
+            
+            await query.edit_message_text(text="📥 Downloading audio...")
+            audio_path = audio_stream.download(output_path=DOWNLOAD_PATH, filename_prefix=f"{unique_id}_audio_")
+
+            # Merge files
+            await query.edit_message_text(text="🔄 Merging video and audio...")
+            output_path = os.path.join(DOWNLOAD_PATH, f"{unique_id}_final.mp4")
+            
+            video_clip = VideoFileClip(video_path)
+            audio_clip = AudioFileClip(audio_path)
+            
+            final_clip = video_clip.set_audio(audio_clip)
+            final_clip.write_videofile(output_path, codec="libx264", audio_codec="aac")
+            
+            final_clip.close()
+            video_clip.close()
+            audio_clip.close()
+
+        elif action == "download_audio":
+            audio_itag = int(data[2])
+            audio_stream = yt.streams.get_by_itag(audio_itag)
+            
+            await query.edit_message_text(text="📥 Downloading audio...")
+            output_path = audio_stream.download(output_path=DOWNLOAD_PATH, filename_prefix=f"{unique_id}_audio_")
+            
+        # Upload to Telegram
+        if output_path and os.path.exists(output_path):
+            file_size = os.path.getsize(output_path) / (1024 * 1024)
+            
+            if file_size > 50: # Telegram bot API limit is 50 MB
+                await query.edit_message_text(text=f"⚠️ File is too large ({file_size:.2f} MB). Telegram bots can only upload files up to 50 MB.")
+                return
+
+            await query.edit_message_text(text=f"📤 Uploading to Telegram...")
+            
+            if action == "download_video":
+                await context.bot.send_video(
+                    chat_id=query.message.chat_id,
+                    video=open(output_path, 'rb'),
+                    caption=yt.title,
+                    supports_streaming=True
+                )
+            elif action == "download_audio":
+                await context.bot.send_audio(
+                    chat_id=query.message.chat_id,
+                    audio=open(output_path, 'rb'),
+                    title=yt.title,
+                    performer=yt.author
+                )
+            
+            # Delete the status message
+            await query.message.delete()
+        else:
+            await query.edit_message_text(text="❌ Failed to create the final file.")
 
     except Exception as e:
-        logger.error(f"Error during download/upload: {e}")
-        await query.edit_message_text(f"An error occurred: {e}")
+        logger.error(f"Error during download/upload for video_id {video_id}: {e}")
+        await query.edit_message_text(text=f"❌ An unexpected error occurred: {e}")
+        
     finally:
-        # Clean up the downloaded file
-        if 'output_filename' in locals() and os.path.exists(output_filename):
-            os.remove(output_filename)
+        # Clean up all temporary files
+        cleanup_files([video_path, audio_path, output_path])
 
 
-async def download_file(url: str, download_type: str, format_id: str, ext: str, context: ContextTypes.DEFAULT_TYPE) -> str:
-    """Downloads the file using yt-dlp based on user's choice."""
-    # Sanitize title for filename
-    title = context.user_data['video_info'].get('title', 'video')
-    safe_title = re.sub(r'[\\/*?:"<>|]', "", title)[:50] # Limit length
-    
-    output_template = f'{safe_title}.%(ext)s'
-    
-    ydl_opts = {
-        'outtmpl': output_template,
-        'noplaylist': True,
-    }
-
-    if download_type == 'video':
-        # THIS IS THE KEY: We specify the chosen video format ID and merge it with the best available audio
-        ydl_opts['format'] = f'{format_id}+bestaudio/best'
-        # To ensure the final container is mp4 if possible
-        ydl_opts['merge_output_format'] = 'mp4'
-
-    elif download_type == 'audio':
-        ydl_opts['format'] = 'bestaudio/best'
-        ydl_opts['postprocessors'] = [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '192',
-        }]
-        # The extension will be mp3 after post-processing
-        output_template = f'{safe_title}.mp3'
-        ydl_opts['outtmpl'] = output_template
-
-
-    elif download_type == 'subtitle':
-        ydl_opts['writesubtitles'] = True
-        ydl_opts['subtitleslangs'] = [format_id] # format_id is the lang_code here
-        ydl_opts['skip_download'] = True
-        # The filename will be title.lang.ext
-        output_template = f'{safe_title}.{format_id}.{ext}'
-        ydl_opts['outtmpl'] = f'{safe_title}.%(ext)s'
-
-
-    with YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
-
-    # Determine the final output filename
-    if download_type == 'audio':
-        return f'{safe_title}.mp3'
-    elif download_type == 'subtitle':
-        # yt-dlp might create a vtt or srt, we check for it
-        for file in os.listdir('.'):
-            if file.startswith(safe_title) and file.endswith(f'.{format_id}.{ext}'):
-                return file
-        return f'{safe_title}.{format_id}.{ext}' # Fallback
-    else: # Video
-        return f'{safe_title}.mp4'
-
-
-# --- Main Bot Execution ---
-
+# --- Main Bot Logic ---
 def main() -> None:
     """Start the bot."""
-    application = Application.builder().token(BOT_TOKEN).build()
+    # Create a directory for downloads if it doesn't exist
+    if not os.path.exists(DOWNLOAD_PATH):
+        os.makedirs(DOWNLOAD_PATH)
 
-    # Register handlers
+    # Create the Application and pass it your bot's token.
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # on different commands - answer in Telegram
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    application.add_handler(CallbackQueryHandler(button_callback_handler))
-
+    application.add_handler(CallbackQueryHandler(button_callback))
+    
     # Run the bot until the user presses Ctrl-C
     logger.info("Bot is running...")
     application.run_polling()
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     main()
